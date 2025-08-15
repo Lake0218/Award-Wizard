@@ -12,13 +12,13 @@ UNCLEAR_TERMS = ["item", "sample", "unknown", "misc", "product", "variety", "gen
 st.set_page_config(page_title="UPC Validator & Product Recommender", layout="wide")
 st.title("🔍 UPC Validator & Product Recommender")
 
-uploaded_file = st.file_uploader("Upload a CSV with a column named 'barcode'", type="csv")
+uploaded_file = st.file_uploader("Upload an Excel file with a column named 'barcode'", type="xlsx")
 
 if uploaded_file:
-    input_df = pd.read_csv(uploaded_file, dtype={'barcode': str})
+    input_df = pd.read_excel(uploaded_file, dtype={'barcode': str})
 
     if 'barcode' not in input_df.columns:
-        st.error("CSV must contain a 'barcode' column.")
+        st.error("Excel file must contain a 'barcode' column.")
     else:
         st.success(f"Loaded {len(input_df)} UPCs")
 
