@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 from io import BytesIO
+import re
 
 DEFAULT_UNCLEAR_TERMS = ["item", "sample", "unknown", "misc", "product", "variety", "generic"]
 
@@ -46,14 +47,35 @@ if uploaded_file:
                 return 'Unclear or Generic'
         return None
 
+    def extract_size_ml(desc):
+        if not isinstance(desc, str):
+            return None
+        match_ml = re.search(r'(\d+(\.\d+)?)\s?m[lL]', desc)
+        match_l = re.search(r'(\d+(\.\d+)?)\s?[lL]', desc)
+
+        if match_ml:
+            return float(match_ml.group(1))
+        elif match_l:
+            return float(match_l.group(1)) * 1000
+        return None
+
+    def flag_size(size_ml):
+        if size_ml is None:
+            return 'No size found'
+        elif size_ml < 750:
+            return 'Too small'
+        return None
+
     filtered_df['description_flag'] = filtered_df['description'].apply(flag_description)
+    filtered_df['parsed_size_ml'] = filtered_df['description'].apply(extract_size_ml)
+    filtered_df['size_flag'] = filtered_df['parsed_size_ml'].apply(flag_size)
 
     st.subheader("🧪 Validation Results")
     st.dataframe(filtered_df)
 
-    flagged_df = filtered_df[filtered_df['description_flag'].notna()]
+    flagged_df = filtered_df[(filtered_df['description_flag'].notna()) | (filtered_df['size_flag'].notna())]
     if not flagged_df.empty:
-        st.warning("🚩 Some UPCs have unclear or problematic descriptions:")
+        st.warning("🚩 Some UPCs have issues with description or size:")
         st.dataframe(flagged_df)
 
         excel_buffer = BytesIO()
