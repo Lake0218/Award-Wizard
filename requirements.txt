@@ -1,4 +1,9 @@
-import streamlit as st
+streamlit
+pandas
+requests
+openpyxl
+xlsxwriter
+
 import pandas as pd
 import requests
 from io import BytesIO
