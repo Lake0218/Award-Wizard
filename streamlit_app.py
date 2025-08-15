@@ -6,10 +6,34 @@ from io import BytesIO
 # Replace this with your actual API endpoint to Pinot
 PINOT_API_ENDPOINT = "https://your-pinot-api-url.com/openai/fetch_gpt_api/sql/query"
 
-UNCLEAR_TERMS = ["item", "sample", "unknown", "misc", "product", "variety", "generic"]
+DEFAULT_UNCLEAR_TERMS = ["item", "sample", "unknown", "misc", "product", "variety", "generic"]
 
 st.set_page_config(page_title="UPC Validator & Product Recommender", layout="wide")
 st.title("🔍 UPC Validator & Product Recommender")
+
+# --- Brand Selector ---
+st.subheader("🏷️ Brand Selector")
+st.write("Start typing to choose a brand to validate.")
+
+# Pull distinct brands from Pinot
+brand_query = "SELECT DISTINCT brand FROM catalog_lookup_gpt ORDER BY brand LIMIT 10000"
+brand_response = requests.post(PINOT_API_ENDPOINT, json={"query": brand_query}, headers={"Content-Type": "application/json"})
+
+brand_options = []
+if brand_response.status_code == 200:
+    brand_data = brand_response.json()
+    brand_options = sorted([row[0] for row in brand_data['resultTable']['rows'] if row[0]])
+else:
+    st.warning("Could not load brand options.")
+
+selected_brand = st.selectbox("Select brand", brand_options, index=0 if brand_options else None)
+
+# --- Custom Description Keywords ---
+st.subheader("🧠 Description Validator")
+description_input = st.text_input("Enter product keywords expected in descriptions (comma-separated)", value="")
+
+custom_keywords = [kw.strip().lower() for kw in description_input.split(",") if kw.strip()] if description_input else []
+UNCLEAR_TERMS = DEFAULT_UNCLEAR_TERMS + custom_keywords
 
 uploaded_file = st.file_uploader("Upload an Excel file with a column named 'barcode'", type="xlsx")
 
@@ -23,7 +47,7 @@ if uploaded_file:
 
         upc_list = input_df['barcode'].dropna().astype(str).unique().tolist()
         upc_clause = ", ".join([f"'{upc}'" for upc in upc_list])
-        ilike_clauses = " OR ".join([f"description ILIKE '%{term}%'" for term in UNCLEAR_TERMS])
+        ilike_clauses = " OR ".join([f"LOWER(description) LIKE '%{term.lower()}%'" for term in UNCLEAR_TERMS])
 
         sql_query = f"""
         SELECT
@@ -43,6 +67,7 @@ if uploaded_file:
             END AS description_flag
         FROM catalog_lookup_gpt
         WHERE barcode IN ({upc_clause})
+        AND brand = '{selected_brand}'
         """
 
         headers = {"Content-Type": "application/json"}
@@ -69,11 +94,10 @@ if uploaded_file:
                 st.download_button("Download flagged UPCs as Excel", data=excel_buffer.getvalue(), file_name="flagged_upcs.xlsx")
 
             st.subheader("💡 Suggested Additional UPCs")
-            brand_filter = st.text_input("Enter brand to find more matching products")
             category_filter = st.text_input("Enter category_1_search_key (optional)")
             keyword_filter = st.text_input("Enter keyword to filter descriptions (optional)")
 
-            if brand_filter:
+            if selected_brand:
                 keyword_clause = f"AND description ILIKE '%{keyword_filter}%'" if keyword_filter else ""
                 category_clause = f"AND category_1_search_key = '{category_filter}'" if category_filter else ""
 
@@ -81,7 +105,7 @@ if uploaded_file:
                 SELECT DISTINCT barcode, brand, manufacturer, description,
                     category_1_search_key, category_2_search_key, category_3_search_key
                 FROM catalog_lookup_gpt
-                WHERE brand = '{brand_filter}'
+                WHERE brand = '{selected_brand}'
                 {category_clause}
                 {keyword_clause}
                 AND barcode NOT IN ({upc_clause})
