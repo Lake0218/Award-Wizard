@@ -4,7 +4,7 @@ import requests
 from io import BytesIO
 
 # Replace this with your actual API endpoint to Pinot
-PINOT_API_ENDPOINT = "https://your-pinot-api-url.com/openai/fetch_gpt_api/sql/query"
+PINOT_API_ENDPOINT = "https://api.fetchrewards.com/openai/fetch_gpt_api/sql/query"
 
 DEFAULT_UNCLEAR_TERMS = ["item", "sample", "unknown", "misc", "product", "variety", "generic"]
 
