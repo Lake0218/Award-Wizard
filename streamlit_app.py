@@ -1,305 +1,262 @@
-# streamlit_app.py
-import streamlit as st
-import pandas as pd
-import re
-from io import BytesIO
+
+import os
 import io
+import json
+import time
+import textwrap
+from typing import List, Tuple, Dict, Optional
 
-DEFAULT_UNCLEAR_TERMS = ["item", "sample", "unknown", "misc", "product", "variety", "generic"]
+import pandas as pd
+import requests
+import streamlit as st
 
-st.set_page_config(page_title="UPC Validator & Product Recommender", layout="wide")
-st.title("🔍 UPC Validator & Product Recommender")
-
-# === Role selection ===========================================================
-role = st.radio(
-    "Who are you?",
-    ["IC (Product File)", "QA (Campaign File)"],
-    horizontal=True,
-    help="Pick IC for product lists; QA for campaign download files."
+# -----------------------------
+# Page & Sidebar
+# -----------------------------
+st.set_page_config(
+    page_title="Award Wizard • UPC Validator & Recommender",
+    page_icon="🪄",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# === Uploaders ================================================================
-if "IC" in role:
-    uploader_label = "Upload product file (CSV or Excel). We’ll map to: barcode, brand, description."
-else:
-    uploader_label = "Upload QA campaign file (CSV or Excel) containing UPC, Description, RequirementName."
+st.title("🪄 Award Wizard — UPC Validator & Recommender")
+st.caption("Validate barcodes, flag vague descriptions, and suggest related products.")
 
-uploaded_file = st.file_uploader(uploader_label, type=["csv", "xlsx", "xls"])
+with st.sidebar:
+    st.header("Settings")
+    st.write("Configure backend or use stub data for demos.")
 
-# === Helpers =================================================================
-ALIAS_BARCODE = {
-    "barcode", "bar_code", "upc", "upc12", "upc-12", "upc_a", "upc-a",
-    "gtin", "gtin12", "gtin-12", "ean", "ean13", "barcode_num", "barcode number"
-}
-ALIAS_BRAND = {"brand", "brand_name", "brand name", "mfrbrand", "mfr_brand"}
-ALIAS_DESCRIPTION = {
-    "description", "desc", "product", "product_name", "product name",
-    "product_description", "product description", "item_description", "item description", "item name", "title"
-}
+    # Pinot config
+    default_endpoint = os.getenv("PINOT_API_ENDPOINT", "")
+    pinot_endpoint = st.text_input("Pinot SQL API Endpoint", value=default_endpoint, placeholder="https://pinot.example.com/query/sql")
+    pinot_auth = st.text_input("Authorization Header (optional)", type="password", help="e.g., 'Bearer <token>' if your Pinot is secured")
 
-def _read_any(file):
-    """Read CSV or Excel to DataFrame (as strings when possible)."""
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        # Keep strings as strings; avoid dtype inference eating leading zeros
-        return pd.read_csv(file, dtype=str, keep_default_na=False)
-    else:
-        data = file.read()
-        # Try openpyxl first, then fallback
+    # Behavior
+    use_stub = st.toggle("Use stub mode (no backend)", value=(not bool(default_endpoint)))
+    batch_size = st.number_input("Query batch size", min_value=50, max_value=5000, value=1000, step=50, help="Number of UPCs per Pinot request")
+    run_button_top = st.button("Run validation ▶", use_container_width=True)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _clean_barcodes(df: pd.DataFrame) -> pd.DataFrame:
+    if "barcode" not in df.columns:
+        raise ValueError("CSV must include a 'barcode' column.")
+    # normalize barcodes to strings without spaces
+    df = df.copy()
+    df["barcode"] = df["barcode"].astype(str).str.strip().str.replace(r"\s+", "", regex=True)
+    df = df[df["barcode"].str.len() > 0].drop_duplicates(subset=["barcode"]).reset_index(drop=True)
+    return df
+
+def _pinot_headers(auth_header: Optional[str]) -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    return headers
+
+def query_pinot_for_upcs(upcs: List[str], endpoint: str, auth_header: Optional[str]) -> pd.DataFrame:
+    """Query Pinot using a SQL IN clause over UPCs. Returns product rows."""
+    if not endpoint:
+        raise ValueError("Pinot endpoint is required when stub mode is off.")
+
+    chunks = [upcs[i:i+batch_size] for i in range(0, len(upcs), batch_size)]
+    frames = []
+    progress = st.progress(0.0, text="Querying Pinot...")
+
+    for i, chunk in enumerate(chunks, start=1):
+        in_list = ",".join([f"'{u}'" for u in chunk])
+        sql = f"""
+            SELECT
+              barcode,
+              brand,
+              category,
+              description,
+              keywords
+            FROM products
+            WHERE barcode IN ({in_list})
+        """
+        payload = {"sql": textwrap.dedent(sql).strip()}
         try:
-            return pd.read_excel(io.BytesIO(data), dtype=str, engine="openpyxl")
-        except Exception:
-            return pd.read_excel(io.BytesIO(data), dtype=str)
+            resp = requests.post(endpoint, headers=_pinot_headers(auth_header), data=json.dumps(payload), timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            st.error(f"Pinot request failed on chunk {i}/{len(chunks)}: {e}")
+            raise
 
-def _normalize_cols(df: pd.DataFrame):
-    """Lowercase/strip columns; return normalized df + map normalized->original (for UI)."""
-    original_cols = list(df.columns)
-    df2 = df.copy()
-    df2.columns = [str(c).strip() for c in df2.columns]
-    normed = [c.lower().strip() for c in df2.columns]
-    df2.columns = normed
-    colmap = dict(zip(normed, original_cols))
-    return df2, colmap
+        # Basic Pinot result parsing; adjust for your specific schema/response
+        rows = data.get("resultTable", {}).get("rows", [])
+        columns = data.get("resultTable", {}).get("dataSchema", {}).get("columnNames", [])
+        if not rows or not columns:
+            frames.append(pd.DataFrame(columns=["barcode","brand","category","description","keywords"]))
+        else:
+            frames.append(pd.DataFrame(rows, columns=columns))
 
-def _auto_pick_column(norm_cols, alias_set):
-    for c in norm_cols:
-        if c in alias_set:
-            return c
-    return None
+        progress.progress(i/len(chunks), text=f"Querying Pinot... ({i}/{len(chunks)})")
 
-def _make_manual_mapping_ui(norm_cols, picked_barcode, picked_brand, picked_description):
-    st.info("We couldn’t confidently match all columns. Please map them below.")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        bc_sel = st.selectbox("Barcode column", ["-- choose --"] + norm_cols,
-                              index=(norm_cols.index(picked_barcode)+1 if picked_barcode in norm_cols else 0))
-    with col2:
-        br_sel = st.selectbox("Brand column (optional)", ["-- choose --"] + norm_cols,
-                              index=(norm_cols.index(picked_brand)+1 if picked_brand in norm_cols else 0))
-    with col3:
-        ds_sel = st.selectbox("Description column", ["-- choose --"] + norm_cols,
-                              index=(norm_cols.index(picked_description)+1 if picked_description in norm_cols else 0))
-    bc_sel = None if bc_sel == "-- choose --" else bc_sel
-    br_sel = None if br_sel == "-- choose --" else br_sel
-    ds_sel = None if ds_sel == "-- choose --" else ds_sel
-    return bc_sel, br_sel, ds_sel
+    progress.empty()
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["barcode","brand","category","description","keywords"])
+    # Ensure required cols exist
+    for col in ["barcode","brand","category","description","keywords"]:
+        if col not in out.columns:
+            out[col] = None
+    return out
 
-def _clean_barcode_series(s: pd.Series) -> pd.Series:
-    """Keep digits only; support EAN/GTIN up to 14 by preserving rightmost digits."""
-    return (
-        s.astype(str)
-         .str.extract(r"(\d+)")[0]
-         .str[-14:]
-         .fillna("")
+def make_stub_catalog(upcs: List[str]) -> pd.DataFrame:
+    """Create a small synthetic catalog for demo/testing without Pinot."""
+    brands = ["Acme", "Globex", "Umbrella", "Initech"]
+    categories = ["Snacks", "Beverages", "Household", "Personal Care"]
+    rows = []
+    for i, u in enumerate(upcs):
+        brand = brands[i % len(brands)]
+        cat = categories[(i // 2) % len(categories)]
+        # Make some poor descriptions to trigger flags
+        if i % 5 == 0:
+            desc = "good product"
+        elif i % 7 == 0:
+            desc = "assorted item"
+        else:
+            desc = f"{brand} {cat} Item {u[-3:]} — 12oz"
+        keys = f"{brand.lower()},{cat.lower()},item"
+        rows.append({"barcode": u, "brand": brand, "category": cat, "description": desc, "keywords": keys})
+    return pd.DataFrame(rows)
+
+def validate_records(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (validated, flagged)."""
+    df = df.copy()
+    df["description"] = df["description"].fillna("")
+    df["brand"] = df["brand"].fillna("")
+    df["category"] = df["category"].fillna("")
+
+    vague_terms = {"assorted", "misc", "variety", "good product", "item", "product"}
+    def is_vague(desc: str) -> bool:
+        lower = desc.lower()
+        return any(term in lower for term in vague_terms) or len(lower.split()) < 3
+
+    df["is_missing_core"] = df[["brand", "category", "description"]].apply(lambda r: any(pd.isna(r) | (r.str.len()==0)), axis=1)
+    df["is_vague"] = df["description"].apply(is_vague)
+    df["needs_review"] = df["is_missing_core"] | df["is_vague"]
+
+    flagged = df[df["needs_review"]].copy()
+    validated = df[~df["needs_review"]].copy()
+    return validated, flagged
+
+def recommend_related(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
+    """Recommend other UPCs to consider by brand/category proximity."""
+    if df.empty:
+        return pd.DataFrame(columns=["source_barcode","suggested_barcode","reason"])
+
+    # Build simple index by brand-category
+    by_bc = df.groupby(["brand","category"])
+    suggestions = []
+    for (b, c), g in by_bc:
+        barcodes = list(g["barcode"])
+        for i, src in enumerate(barcodes):
+            # suggest next k items in the group (toy logic)
+            others = [x for x in barcodes if x != src][:k]
+            for o in others:
+                suggestions.append({"source_barcode": src, "suggested_barcode": o, "reason": f"Same brand '{b}' and category '{c}'"})
+
+    return pd.DataFrame(suggestions).drop_duplicates().reset_index(drop=True)
+
+def csv_download(name: str, df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info(f"No rows to download for **{name}**.")
+        return
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False)
+    st.download_button(
+        f"Download {name}.csv",
+        data=buf.getvalue(),
+        file_name=f"{name}.csv",
+        mime="text/csv",
+        use_container_width=True,
     )
 
-# === IC normalization =========================================================
-def normalize_ic(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df_norm, _ = _normalize_cols(df_raw)
-    norm_cols = list(df_norm.columns)
-    picked_barcode = _auto_pick_column(norm_cols, ALIAS_BARCODE)
-    picked_brand = _auto_pick_column(norm_cols, ALIAS_BRAND)
-    picked_description = _auto_pick_column(norm_cols, ALIAS_DESCRIPTION)
+# -----------------------------
+# Main UI
+# -----------------------------
+left, right = st.columns([2,1])
 
-    # If missing key picks, ask user to map
-    if not picked_barcode or not picked_description:
-        picked_barcode, picked_brand, picked_description = _make_manual_mapping_ui(
-            norm_cols, picked_barcode, picked_brand, picked_description
-        )
+with left:
+    st.subheader("1) Upload CSV of barcodes")
+    uploaded = st.file_uploader("CSV must include a 'barcode' column", type=["csv"])
 
-    missing = []
-    if not picked_barcode: missing.append("barcode")
-    if not picked_description: missing.append("description")
-    if missing:
-        st.error(f"Please map the following required column(s): {', '.join(missing)}.")
-        return pd.DataFrame(columns=["barcode", "brand", "description"])
+    st.subheader("2) Validate & analyze")
+    run = st.button("Run validation (duplicate of sidebar) ▶", use_container_width=True)
 
-    out = pd.DataFrame()
-    out["barcode"] = _clean_barcode_series(df_norm[picked_barcode])
-    out["description"] = df_norm[picked_description].astype(str).str.strip()
-    if picked_brand and picked_brand in df_norm.columns:
-        out["brand"] = df_norm[picked_brand].astype(str).str.strip()
-    else:
-        out["brand"] = ""
-    # Right-pad to common UPC length for display; keep digits only for validation use
-    # (You can remove zfill if you prefer raw GTIN/EAN lengths.)
-    out["barcode"] = out["barcode"].str.zfill(12).str[-14:]
-    return out[["barcode", "brand", "description"]]
+with right:
+    st.subheader("Help")
+    st.markdown(
+        """
+        **CSV Format**  
+        A single column named `barcode`:
+        ```
+        barcode
+        0123456789012
+        0001234567890
+        ```
 
-# === QA normalization & split (Awarding vs Audience) =========================
-def normalize_qa_and_split(df_raw: pd.DataFrame, append_size_to_desc: bool = True):
-    """
-    Expect columns (case-insensitive): UPC, Description, RequirementName
-    'Unlabeled Requirement' => awarding; others => audience.
-    Returns awarding_df (canonical), audience_df (canonical), and a small summary dict.
-    """
-    df, _ = _normalize_cols(df_raw)
-    required = ["upc", "description", "requirementname"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.error(f"QA file is missing required column(s): {missing}. Make sure your campaign export includes UPC, Description, RequirementName.")
-        return pd.DataFrame(columns=["barcode", "brand", "description"]), pd.DataFrame(columns=["barcode", "brand", "description"]), {}
-
-    # Build base
-    work = pd.DataFrame(index=df.index)
-    work["barcode"] = _clean_barcode_series(df["upc"])
-    # description (+ optional Size)
-    desc = df["description"].astype(str).str.strip()
-    if append_size_to_desc and "size" in df.columns:
-        size = df["size"].astype(str).str.strip()
-        work["description"] = [
-            d if (not s or s.lower() in d.lower()) else f"{d} - {s}"
-            for d, s in zip(desc, size)
-        ]
-    else:
-        work["description"] = desc
-    # Brand not present in QA; leave blank (can be backfilled from catalog later)
-    work["brand"] = ""
-
-    # Tag awarding vs audience
-    rn = df["requirementname"].astype(str).fillna("").str.strip()
-    awarding_mask = rn.str.casefold().eq("unlabeled requirement")
-
-    awarding = work[awarding_mask].copy().reset_index(drop=True)
-    audience = work[~awarding_mask].copy().reset_index(drop=True)
-
-    # Basic hygiene warning
-    bad = ~work["barcode"].str.match(r"^\d{8,14}$")
-    if bad.any():
-        st.warning(f"{int(bad.sum())} row(s) have non-8/12/13/14-digit barcodes after cleaning.")
-
-    summary = {
-        "rows_total": len(work),
-        "rows_awarding": len(awarding),
-        "rows_audience": len(audience),
-    }
-    # Canonical column order
-    awarding = awarding[["barcode", "brand", "description"]]
-    audience = audience[["barcode", "brand", "description"]]
-    return awarding, audience, summary
-
-# === Description/Size Validation =============================================
-def build_unclear_terms():
-    st.subheader("🧠 Description Validator")
-    description_input = st.text_input(
-        "Enter product keywords expected in descriptions (comma-separated)",
-        value=""
+        **Stub Mode**  
+        If enabled, the app generates a synthetic catalog so you can try the flow without Pinot.
+        """
     )
-    custom_keywords = [kw.strip().lower() for kw in description_input.split(",") if kw.strip()] if description_input else []
-    return DEFAULT_UNCLEAR_TERMS + custom_keywords
 
-def extract_size_ml(desc):
-    if not isinstance(desc, str):
-        return None
-    # Look for patterns like "750 ml", "1.5 L"
-    match_ml = re.search(r'(\d+(\.\d+)?)\s?m[lL]\b', desc)
-    match_l = re.search(r'(\d+(\.\d+)?)\s?[lL]\b', desc)
-    if match_ml:
-        try:
-            return float(match_ml.group(1))
-        except Exception:
-            return None
-    if match_l:
-        try:
-            return float(match_l.group(1)) * 1000
-        except Exception:
-            return None
-    return None
+trigger = run or run_button_top
 
-def flag_description(desc, ilike_clauses):
-    if pd.isna(desc) or len(str(desc)) < 10:
-        return 'Too short'
-    for term in ilike_clauses:
-        if term in str(desc).lower():
-            return 'Unclear or Generic'
-    return None
+if trigger:
+    if uploaded is None:
+        st.warning("Please upload a CSV first.")
+        st.stop()
 
-def flag_size(size_ml):
-    if size_ml is None:
-        return 'No size found'
-    elif size_ml < 750:
-        return 'Too small'
-    return None
+    try:
+        raw = pd.read_csv(uploaded)
+        upc_df = _clean_barcodes(raw)
+    except Exception as e:
+        st.error(f"Failed to read/clean CSV: {e}")
+        st.stop()
 
-# === Main flow ===============================================================
-canonical_df = pd.DataFrame(columns=["barcode", "brand", "description"])
-audience_df = pd.DataFrame(columns=["barcode", "brand", "description"])  # only for QA view
+    st.success(f"Loaded {len(upc_df)} unique barcodes.")
+    st.dataframe(upc_df.head(20), use_container_width=True)
 
-if uploaded_file is not None:
-    df_raw = _read_any(uploaded_file)
-    if df_raw.empty:
-        st.error("The uploaded file appears to be empty.")
+    # Query catalog
+    if use_stub:
+        with st.spinner("Generating stub catalog..."):
+            catalog_df = make_stub_catalog(upc_df["barcode"].tolist())
     else:
-        if "IC" in role:
-            st.caption("IC mode: expecting product master files. We’ll normalize aliases and barcodes.")
-            canonical_df = normalize_ic(df_raw)
-            if not canonical_df.empty:
-                st.success(f"Ingested {len(canonical_df):,} rows ✓")
-                st.dataframe(canonical_df.head(25), use_container_width=True)
-        else:
-            st.caption("QA mode: campaign files with UPC, Description, RequirementName. We’ll split awarding vs audience and validate awarding.")
-            append_size = st.checkbox("Append Size to description (if present)", value=True)
-            awarding_df, audience_df, summary = normalize_qa_and_split(df_raw, append_size_to_desc=append_size)
-            if summary:
-                st.info(f"Rows: {summary['rows_total']:,} • Awarding: {summary['rows_awarding']:,} • Audience: {summary['rows_audience']:,}")
-            if not awarding_df.empty:
-                with st.expander("Preview: Awarding UPCs (canonical)"):
-                    st.dataframe(awarding_df.head(50), use_container_width=True)
-                with st.expander("Preview: Audience UPCs (FYI)"):
-                    st.dataframe(audience_df.head(50), use_container_width=True)
-                canonical_df = awarding_df  # Only awarding moves to validation
+        with st.spinner("Querying Pinot..."):
+            catalog_df = query_pinot_for_upcs(upc_df["barcode"].tolist(), pinot_endpoint, pinot_auth)
 
-                # Optional downloads
-                st.download_button(
-                    "Download awarding UPCs (canonical CSV)",
-                    awarding_df.to_csv(index=False).encode("utf-8"),
-                    file_name="awarding_upcs_canonical.csv",
-                    mime="text/csv",
-                )
-                st.download_button(
-                    "Download audience UPCs (CSV)",
-                    audience_df.to_csv(index=False).encode("utf-8"),
-                    file_name="audience_upcs.csv",
-                    mime="text/csv",
-                )
+    st.subheader("Catalog results")
+    if catalog_df.empty:
+        st.warning("No matches returned. Check your endpoint, auth, or UPC values.")
+    st.dataframe(catalog_df.head(50), use_container_width=True)
 
-# === Validation section (runs on canonical_df) ===============================
-UNCLEAR_TERMS = build_unclear_terms()
+    # Validation
+    with st.spinner("Validating records..."):
+        validated_df, flagged_df = validate_records(catalog_df)
 
-if not canonical_df.empty:
-    st.subheader("🧪 Validation Results")
+    val_col, flag_col = st.columns(2)
+    with val_col:
+        st.markdown(f"### ✅ Validated ({len(validated_df)})")
+        st.dataframe(validated_df.head(50), use_container_width=True)
+        csv_download("validated", validated_df)
 
-    # Brand filter (only if there are non-empty brands)
-    brand_options = sorted([b for b in canonical_df["brand"].dropna().unique().tolist() if str(b).strip()])
-    if brand_options:
-        selected_brand = st.selectbox("Filter by brand (optional)", ["(All brands)"] + brand_options)
-        if selected_brand != "(All brands)":
-            validate_df = canonical_df[canonical_df["brand"] == selected_brand].copy()
-            st.caption(f"Filtered to {len(validate_df):,} rows for brand '{selected_brand}'.")
-        else:
-            validate_df = canonical_df.copy()
-    else:
-        validate_df = canonical_df.copy()
+    with flag_col:
+        st.markdown(f"### 🟥 Needs Review ({len(flagged_df)})")
+        st.dataframe(flagged_df.head(50), use_container_width=True)
+        csv_download("needs_review", flagged_df)
 
-    # Normalize barcode display to 12–14 digits (keep whatever length is present)
-    validate_df["barcode"] = validate_df["barcode"].astype(str).str.replace(r"\D", "", regex=True).str[-14:]
+    # Recommendations
+    with st.spinner("Building recommendations..."):
+        recs_df = recommend_related(catalog_df, k=3)
 
-    # Apply flags
-    validate_df["description_flag"] = validate_df["description"].apply(lambda d: flag_description(d, UNCLEAR_TERMS))
-    validate_df["parsed_size_ml"] = validate_df["description"].apply(extract_size_ml)
-    validate_df["size_flag"] = validate_df["parsed_size_ml"].apply(flag_size)
+    st.markdown(f"### 🔎 Related product suggestions ({len(recs_df)})")
+    st.dataframe(recs_df.head(100), use_container_width=True)
+    csv_download("recommendations", recs_df)
 
-    st.dataframe(validate_df, use_container_width=True)
+    st.toast("Done!", icon="✅")
 
-    flagged_df = validate_df[(validate_df['description_flag'].notna()) | (validate_df['size_flag'].notna())]
-    if not flagged_df.empty:
-        st.warning("🚩 Some UPCs have issues with description or size:")
-        st.dataframe(flagged_df, use_container_width=True)
-
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-            flagged_df.to_excel(writer, index=False, sheet_name='Flagged')
-        st.download_button("Download flagged UPCs as Excel", data=excel_buffer.getvalue(), file_name="flagged_upcs.xlsx")
-
-else:
-    st.info("Upload a file above to begin.")
+st.markdown("---")
+st.caption("Tip: Set `PINOT_API_ENDPOINT` as an environment variable to auto-fill the endpoint field.")
